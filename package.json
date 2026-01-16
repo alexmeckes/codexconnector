@@ -1,0 +1,19 @@
+{
+  "name": "codex-connector",
+  "version": "1.0.0",
+  "description": "MCP server that connects Claude Code to OpenAI Codex CLI",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "codex-connector": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
