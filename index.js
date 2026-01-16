@@ -30,6 +30,9 @@ const TASKS_FILE = join(DATA_DIR, "tasks.json");
 // In-memory task tracking (also persisted to disk)
 const tasks = new Map();
 
+// Active process handles (for running tasks)
+const activeProcesses = new Map();
+
 // Initialize directories
 async function initDirs() {
   await mkdir(LOGS_DIR, { recursive: true });
@@ -40,7 +43,8 @@ async function initDirs() {
     for (const [id, task] of Object.entries(savedTasks)) {
       // Mark any "running" tasks from previous sessions as "unknown"
       if (task.status === "running") {
-        task.status = "unknown (server restarted)";
+        task.status = "interrupted";
+        task.failureReason = "Server restarted while task was running";
       }
       tasks.set(id, task);
     }
@@ -54,10 +58,38 @@ async function saveTasks() {
   await writeFile(TASKS_FILE, JSON.stringify(obj, null, 2));
 }
 
+// Format duration in human readable form
+function formatDuration(ms) {
+  if (ms < 1000) return `${ms}ms`;
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`;
+  if (ms < 3600000) return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s`;
+  return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m`;
+}
+
+// Signal name mapping
+const SIGNALS = {
+  1: "SIGHUP",
+  2: "SIGINT",
+  3: "SIGQUIT",
+  6: "SIGABRT",
+  9: "SIGKILL",
+  14: "SIGALRM",
+  15: "SIGTERM",
+};
+
+function getSignalName(code) {
+  if (code === null) return null;
+  if (code > 128) {
+    const signal = code - 128;
+    return SIGNALS[signal] || `signal ${signal}`;
+  }
+  return null;
+}
+
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: {
@@ -113,7 +145,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "codex_status",
         description:
-          "Check the status of a Codex task. Returns status, logs, and result if completed.",
+          "Check the status of a Codex task. Returns status, logs, diagnostics, and result if completed.",
         inputSchema: {
           type: "object",
           properties: {
@@ -138,7 +170,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             status: {
               type: "string",
-              enum: ["all", "running", "completed", "failed"],
+              enum: ["all", "running", "completed", "failed", "interrupted"],
               description: "Filter by status (default: all)",
               default: "all",
             },
@@ -207,24 +239,9 @@ async function handleCodexAgent(args) {
 
   const logFile = join(LOGS_DIR, `${taskId}.log`);
   const resultFile = join(LOGS_DIR, `${taskId}.result`);
+  const debugFile = join(LOGS_DIR, `${taskId}.debug.json`);
 
-  // Create task record
-  const taskRecord = {
-    id: taskId,
-    task,
-    sandbox,
-    workingDirectory,
-    model,
-    status: "running",
-    startedAt: new Date().toISOString(),
-    logFile,
-    resultFile,
-    pid: null,
-  };
-  tasks.set(taskId, taskRecord);
-  await saveTasks();
-
-  // Start the codex process
+  // Build the codex command
   const codexArgs = [
     "exec",
     "--full-auto",
@@ -239,10 +256,65 @@ async function handleCodexAgent(args) {
     codexArgs.splice(1, 0, "--model", model);
   }
 
+  const fullCommand = `${CODEX_PATH} ${codexArgs.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')}`;
+
+  // Create task record with enhanced debugging info
+  const taskRecord = {
+    id: taskId,
+    task,
+    sandbox,
+    workingDirectory,
+    model,
+    status: "running",
+    startedAt: new Date().toISOString(),
+    logFile,
+    resultFile,
+    debugFile,
+    pid: null,
+    // Debug info
+    command: fullCommand,
+    codexPath: CODEX_PATH,
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    lastActivityAt: new Date().toISOString(),
+    lastActivityType: "started",
+    heartbeatCount: 0,
+    timeoutMs,
+    // Failure tracking
+    exitCode: null,
+    exitSignal: null,
+    failureReason: null,
+  };
+  tasks.set(taskId, taskRecord);
+  await saveTasks();
+
+  // Write initial debug info
+  await writeFile(debugFile, JSON.stringify({
+    taskId,
+    command: fullCommand,
+    codexPath: CODEX_PATH,
+    workingDirectory,
+    env: {
+      PATH: process.env.PATH,
+      HOME: process.env.HOME,
+      OPENAI_API_KEY: process.env.OPENAI_API_KEY ? "(set)" : "(not set)",
+    },
+    startedAt: taskRecord.startedAt,
+  }, null, 2));
+
   const logStream = createWriteStream(logFile, { flags: "a" });
-  await appendFile(logFile, `[${new Date().toISOString()}] Starting Codex task: ${task}\n`);
-  await appendFile(logFile, `[${new Date().toISOString()}] Working directory: ${workingDirectory}\n`);
-  await appendFile(logFile, `[${new Date().toISOString()}] Sandbox: ${sandbox}\n\n`);
+
+  // Enhanced logging header
+  await appendFile(logFile, `${"=".repeat(60)}\n`);
+  await appendFile(logFile, `[${new Date().toISOString()}] TASK STARTED\n`);
+  await appendFile(logFile, `${"=".repeat(60)}\n`);
+  await appendFile(logFile, `Task ID: ${taskId}\n`);
+  await appendFile(logFile, `Command: ${fullCommand}\n`);
+  await appendFile(logFile, `Working directory: ${workingDirectory}\n`);
+  await appendFile(logFile, `Sandbox: ${sandbox}\n`);
+  await appendFile(logFile, `Model: ${model || "(default)"}\n`);
+  await appendFile(logFile, `Timeout: ${timeoutMs > 0 ? `${timeoutMs}ms` : "none"}\n`);
+  await appendFile(logFile, `${"=".repeat(60)}\n\n`);
 
   const codex = spawn(CODEX_PATH, codexArgs, {
     cwd: workingDirectory,
@@ -251,72 +323,187 @@ async function handleCodexAgent(args) {
   });
 
   taskRecord.pid = codex.pid;
+  activeProcesses.set(taskId, codex);
+  await appendFile(logFile, `[${new Date().toISOString()}] Process spawned with PID ${codex.pid}\n\n`);
   await saveTasks();
 
-  // Stream output to log file
+  // Track activity and bytes
+  const updateActivity = (type, bytes = 0) => {
+    taskRecord.lastActivityAt = new Date().toISOString();
+    taskRecord.lastActivityType = type;
+    if (type === "stdout") taskRecord.stdoutBytes += bytes;
+    if (type === "stderr") taskRecord.stderrBytes += bytes;
+  };
+
+  // Stream output to log file with activity tracking
   codex.stdout.on("data", (data) => {
     logStream.write(data);
+    updateActivity("stdout", data.length);
   });
 
   codex.stderr.on("data", (data) => {
     logStream.write(`[stderr] ${data}`);
+    updateActivity("stderr", data.length);
   });
+
+  // Heartbeat logging for long-running tasks
+  const heartbeatInterval = setInterval(async () => {
+    if (taskRecord.status !== "running") {
+      clearInterval(heartbeatInterval);
+      return;
+    }
+
+    taskRecord.heartbeatCount++;
+    const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
+    const lastActivity = Date.now() - new Date(taskRecord.lastActivityAt).getTime();
+
+    const heartbeatMsg = `[${new Date().toISOString()}] HEARTBEAT #${taskRecord.heartbeatCount}: ` +
+      `elapsed=${formatDuration(elapsed)}, ` +
+      `lastActivity=${formatDuration(lastActivity)} ago (${taskRecord.lastActivityType}), ` +
+      `stdout=${taskRecord.stdoutBytes}B, stderr=${taskRecord.stderrBytes}B\n`;
+
+    await appendFile(logFile, heartbeatMsg);
+
+    // Warn if no activity for 2+ minutes
+    if (lastActivity > 120000) {
+      await appendFile(logFile, `[${new Date().toISOString()}] WARNING: No activity for ${formatDuration(lastActivity)}\n`);
+    }
+
+    await saveTasks();
+  }, 30000); // Every 30 seconds
 
   // Set up timeout if specified
   let timeout = null;
   if (timeoutMs > 0) {
-    timeout = setTimeout(() => {
-      appendFile(logFile, `\n[${new Date().toISOString()}] TIMEOUT: Killing process after ${timeoutMs}ms\n`);
+    timeout = setTimeout(async () => {
+      const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
+      taskRecord.failureReason = `Timeout after ${formatDuration(elapsed)} (limit: ${formatDuration(timeoutMs)})`;
+
+      await appendFile(logFile, `\n${"!".repeat(60)}\n`);
+      await appendFile(logFile, `[${new Date().toISOString()}] TIMEOUT: Killing process after ${formatDuration(timeoutMs)}\n`);
+      await appendFile(logFile, `${"!".repeat(60)}\n`);
+
       codex.kill("SIGTERM");
-      setTimeout(() => codex.kill("SIGKILL"), 5000);
+      setTimeout(() => {
+        if (taskRecord.status === "running") {
+          codex.kill("SIGKILL");
+        }
+      }, 5000);
     }, timeoutMs);
   }
 
   // Handle completion
   const completionPromise = new Promise((resolve) => {
-    codex.on("close", async (code) => {
+    codex.on("close", async (code, signal) => {
+      clearInterval(heartbeatInterval);
       if (timeout) clearTimeout(timeout);
+      activeProcesses.delete(taskId);
 
       const endTime = new Date().toISOString();
-      await appendFile(logFile, `\n[${endTime}] Process exited with code ${code}\n`);
+      const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
+
+      // Determine failure reason
+      let failureReason = taskRecord.failureReason; // May already be set by timeout
+      const signalName = signal || getSignalName(code);
+
+      if (!failureReason) {
+        if (signal) {
+          failureReason = `Killed by signal: ${signal}`;
+        } else if (signalName && code !== 0) {
+          failureReason = `Killed by ${signalName} (exit code ${code})`;
+        } else if (code !== 0) {
+          failureReason = `Exited with code ${code}`;
+        }
+      }
+
+      // Write detailed exit info
+      await appendFile(logFile, `\n${"=".repeat(60)}\n`);
+      await appendFile(logFile, `[${endTime}] TASK ${code === 0 ? "COMPLETED" : "FAILED"}\n`);
+      await appendFile(logFile, `${"=".repeat(60)}\n`);
+      await appendFile(logFile, `Exit code: ${code}\n`);
+      await appendFile(logFile, `Exit signal: ${signal || signalName || "none"}\n`);
+      await appendFile(logFile, `Duration: ${formatDuration(elapsed)}\n`);
+      await appendFile(logFile, `Total stdout: ${taskRecord.stdoutBytes} bytes\n`);
+      await appendFile(logFile, `Total stderr: ${taskRecord.stderrBytes} bytes\n`);
+      await appendFile(logFile, `Heartbeats: ${taskRecord.heartbeatCount}\n`);
+      if (failureReason) {
+        await appendFile(logFile, `Failure reason: ${failureReason}\n`);
+      }
+      await appendFile(logFile, `${"=".repeat(60)}\n`);
+
       logStream.end();
 
       // Read result file
       let result = null;
       try {
         result = await readFile(resultFile, "utf-8");
-      } catch {
-        // No result file
+        await appendFile(logFile, `\nResult file found (${result.length} bytes)\n`);
+      } catch (err) {
+        await appendFile(logFile, `\nNo result file: ${err.code}\n`);
       }
 
+      // Update task record
       taskRecord.status = code === 0 ? "completed" : "failed";
       taskRecord.exitCode = code;
+      taskRecord.exitSignal = signal || signalName;
       taskRecord.completedAt = endTime;
+      taskRecord.duration = elapsed;
+      taskRecord.durationFormatted = formatDuration(elapsed);
       taskRecord.result = result;
       taskRecord.pid = null;
+      if (failureReason) taskRecord.failureReason = failureReason;
+
+      // Update debug file
+      await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
       await saveTasks();
 
       resolve({
         status: taskRecord.status,
         exitCode: code,
+        exitSignal: taskRecord.exitSignal,
+        duration: elapsed,
+        durationFormatted: formatDuration(elapsed),
+        failureReason,
         result,
       });
     });
 
     codex.on("error", async (err) => {
+      clearInterval(heartbeatInterval);
       if (timeout) clearTimeout(timeout);
+      activeProcesses.delete(taskId);
 
-      await appendFile(logFile, `\n[${new Date().toISOString()}] Process error: ${err.message}\n`);
+      const endTime = new Date().toISOString();
+      const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
+      const failureReason = `Process error: ${err.message} (${err.code || "unknown"})`;
+
+      await appendFile(logFile, `\n${"!".repeat(60)}\n`);
+      await appendFile(logFile, `[${endTime}] PROCESS ERROR\n`);
+      await appendFile(logFile, `${"!".repeat(60)}\n`);
+      await appendFile(logFile, `Error: ${err.message}\n`);
+      await appendFile(logFile, `Code: ${err.code || "unknown"}\n`);
+      await appendFile(logFile, `Duration: ${formatDuration(elapsed)}\n`);
+      await appendFile(logFile, `${"!".repeat(60)}\n`);
+
       logStream.end();
 
       taskRecord.status = "failed";
       taskRecord.error = err.message;
+      taskRecord.failureReason = failureReason;
+      taskRecord.completedAt = endTime;
+      taskRecord.duration = elapsed;
+      taskRecord.durationFormatted = formatDuration(elapsed);
       taskRecord.pid = null;
+
+      await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
       await saveTasks();
 
       resolve({
         status: "failed",
         error: err.message,
+        failureReason,
+        duration: elapsed,
+        durationFormatted: formatDuration(elapsed),
       });
     });
   });
@@ -327,7 +514,14 @@ async function handleCodexAgent(args) {
       content: [
         {
           type: "text",
-          text: `## Codex Task Started\n\n**Task ID:** \`${taskId}\`\n**Status:** running\n**Log file:** ${logFile}\n\nUse \`codex_status\` with this task ID to check progress.\nUse \`codex_cancel\` to stop the task.`,
+          text: `## Codex Task Started\n\n` +
+            `**Task ID:** \`${taskId}\`\n` +
+            `**PID:** ${codex.pid}\n` +
+            `**Status:** running\n` +
+            `**Log file:** ${logFile}\n` +
+            `**Debug file:** ${debugFile}\n\n` +
+            `Use \`codex_status\` with this task ID to check progress.\n` +
+            `Use \`codex_cancel\` to stop the task.`,
         },
       ],
     };
@@ -338,7 +532,7 @@ async function handleCodexAgent(args) {
       content: [
         {
           type: "text",
-          text: formatResult(taskId, result),
+          text: formatResult(taskId, taskRecord, result),
         },
       ],
     };
@@ -357,6 +551,14 @@ async function handleCodexStatus(args) {
     };
   }
 
+  // Calculate elapsed/duration
+  const startTime = new Date(taskRecord.startedAt).getTime();
+  const endTime = taskRecord.completedAt ? new Date(taskRecord.completedAt).getTime() : Date.now();
+  const elapsed = endTime - startTime;
+  const lastActivity = taskRecord.lastActivityAt
+    ? Date.now() - new Date(taskRecord.lastActivityAt).getTime()
+    : null;
+
   // Read recent log lines
   let recentLogs = "";
   try {
@@ -370,19 +572,35 @@ async function handleCodexStatus(args) {
   let output = `## Codex Task Status\n\n`;
   output += `**Task ID:** ${taskId}\n`;
   output += `**Status:** ${taskRecord.status}\n`;
-  output += `**Task:** ${taskRecord.task}\n`;
+  output += `**Task:** ${taskRecord.task.slice(0, 100)}${taskRecord.task.length > 100 ? '...' : ''}\n`;
   output += `**Started:** ${taskRecord.startedAt}\n`;
+
+  if (taskRecord.status === "running") {
+    output += `**Elapsed:** ${formatDuration(elapsed)}\n`;
+    output += `**PID:** ${taskRecord.pid}\n`;
+    if (lastActivity !== null) {
+      output += `**Last activity:** ${formatDuration(lastActivity)} ago (${taskRecord.lastActivityType})\n`;
+    }
+    output += `**Heartbeats:** ${taskRecord.heartbeatCount}\n`;
+  }
 
   if (taskRecord.completedAt) {
     output += `**Completed:** ${taskRecord.completedAt}\n`;
+    output += `**Duration:** ${taskRecord.durationFormatted || formatDuration(elapsed)}\n`;
   }
 
-  if (taskRecord.exitCode !== undefined) {
-    output += `**Exit code:** ${taskRecord.exitCode}\n`;
-  }
+  // Diagnostics section
+  output += `\n### Diagnostics\n`;
+  output += `| Metric | Value |\n`;
+  output += `|--------|-------|\n`;
+  output += `| Exit code | ${taskRecord.exitCode ?? "(running)"} |\n`;
+  output += `| Exit signal | ${taskRecord.exitSignal || "none"} |\n`;
+  output += `| Stdout bytes | ${taskRecord.stdoutBytes || 0} |\n`;
+  output += `| Stderr bytes | ${taskRecord.stderrBytes || 0} |\n`;
+  output += `| Timeout | ${taskRecord.timeoutMs > 0 ? `${taskRecord.timeoutMs}ms` : "none"} |\n`;
 
-  if (taskRecord.pid) {
-    output += `**PID:** ${taskRecord.pid}\n`;
+  if (taskRecord.failureReason) {
+    output += `\n### Failure Reason\n\`\`\`\n${taskRecord.failureReason}\n\`\`\`\n`;
   }
 
   output += `\n### Recent Logs (last ${tailLines} lines)\n\`\`\`\n${recentLogs}\n\`\`\`\n`;
@@ -390,6 +608,9 @@ async function handleCodexStatus(args) {
   if (taskRecord.result) {
     output += `\n### Result\n${taskRecord.result}\n`;
   }
+
+  // Add debug file location
+  output += `\n---\n**Debug file:** ${taskRecord.debugFile}\n`;
 
   return {
     content: [{ type: "text", text: output }],
@@ -417,12 +638,16 @@ async function handleCodexTasks(args) {
   }
 
   let output = `## Codex Tasks (${statusFilter})\n\n`;
-  output += `| ID | Status | Task | Started |\n`;
-  output += `|----|--------|------|--------|\n`;
+  output += `| ID | Status | Duration | Exit | Task |\n`;
+  output += `|----|--------|----------|------|------|\n`;
 
   for (const t of filtered) {
-    const shortTask = t.task.length > 40 ? t.task.slice(0, 40) + "..." : t.task;
-    output += `| ${t.id} | ${t.status} | ${shortTask} | ${t.startedAt} |\n`;
+    const shortTask = t.task.length > 30 ? t.task.slice(0, 30) + "..." : t.task;
+    const duration = t.durationFormatted || (t.status === "running"
+      ? formatDuration(Date.now() - new Date(t.startedAt).getTime())
+      : "-");
+    const exit = t.exitSignal || (t.exitCode !== null ? t.exitCode : "-");
+    output += `| ${t.id} | ${t.status} | ${duration} | ${exit} | ${shortTask} |\n`;
   }
 
   return {
@@ -441,22 +666,35 @@ async function handleCodexCancel(args) {
     };
   }
 
-  if (taskRecord.status !== "running" || !taskRecord.pid) {
+  if (taskRecord.status !== "running") {
     return {
       content: [{ type: "text", text: `Task ${taskId} is not running (status: ${taskRecord.status})` }],
     };
   }
 
+  const codex = activeProcesses.get(taskId);
+  if (!codex) {
+    return {
+      content: [{ type: "text", text: `Task ${taskId} has no active process handle` }],
+      isError: true,
+    };
+  }
+
   try {
-    process.kill(taskRecord.pid, "SIGTERM");
-    await appendFile(taskRecord.logFile, `\n[${new Date().toISOString()}] Task cancelled by user\n`);
+    taskRecord.failureReason = "Cancelled by user";
+    await appendFile(taskRecord.logFile, `\n[${new Date().toISOString()}] CANCELLED: User requested cancellation\n`);
+
+    codex.kill("SIGTERM");
 
     // Give it a moment then force kill if needed
     setTimeout(() => {
-      try {
-        process.kill(taskRecord.pid, "SIGKILL");
-      } catch {
-        // Already dead
+      if (taskRecord.status === "running") {
+        try {
+          codex.kill("SIGKILL");
+          appendFile(taskRecord.logFile, `[${new Date().toISOString()}] SIGKILL sent after SIGTERM timeout\n`);
+        } catch {
+          // Already dead
+        }
       }
     }, 5000);
 
@@ -471,19 +709,36 @@ async function handleCodexCancel(args) {
   }
 }
 
-function formatResult(taskId, result) {
+function formatResult(taskId, taskRecord, result) {
   const status = result.status === "completed" ? "completed successfully" : result.status;
   let output = `## Codex Agent Result\n\n`;
   output += `**Task ID:** ${taskId}\n`;
   output += `**Status:** ${status}\n`;
+  output += `**Duration:** ${result.durationFormatted}\n`;
 
-  if (result.exitCode !== undefined) {
+  if (result.exitCode !== undefined && result.exitCode !== null) {
     output += `**Exit code:** ${result.exitCode}\n`;
+  }
+
+  if (result.exitSignal) {
+    output += `**Exit signal:** ${result.exitSignal}\n`;
+  }
+
+  if (result.failureReason) {
+    output += `**Failure reason:** ${result.failureReason}\n`;
   }
 
   if (result.error) {
     output += `**Error:** ${result.error}\n`;
   }
+
+  // Diagnostics summary
+  output += `\n### Diagnostics\n`;
+  output += `- Stdout: ${taskRecord.stdoutBytes} bytes\n`;
+  output += `- Stderr: ${taskRecord.stderrBytes} bytes\n`;
+  output += `- Heartbeats: ${taskRecord.heartbeatCount}\n`;
+  output += `- Log file: ${taskRecord.logFile}\n`;
+  output += `- Debug file: ${taskRecord.debugFile}\n`;
 
   if (result.result) {
     output += `\n### Output\n${result.result}\n`;
@@ -497,8 +752,9 @@ async function main() {
   await initDirs();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Codex Connector MCP server running on stdio");
+  console.error("Codex Connector MCP server v1.1.0 running on stdio");
   console.error(`Logs directory: ${LOGS_DIR}`);
+  console.error(`Codex path: ${CODEX_PATH}`);
 }
 
 main().catch((error) => {
