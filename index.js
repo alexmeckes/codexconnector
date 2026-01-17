@@ -86,10 +86,14 @@ function getSignalName(code) {
   return null;
 }
 
+// Default model and reasoning settings
+const DEFAULT_MODEL = "gpt-5.2-codex";
+const DEFAULT_REASONING_EFFORT = "high";
+
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.2.0",
+    version: "1.3.0",
   },
   {
     capabilities: {
@@ -144,7 +148,14 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             model: {
               type: "string",
-              description: "Optional model override",
+              description: "Model to use. Defaults to gpt-5.2-codex.",
+              default: "gpt-5.2-codex",
+            },
+            reasoningEffort: {
+              type: "string",
+              enum: ["low", "medium", "high"],
+              description: "Reasoning effort level. Defaults to high.",
+              default: "high",
             },
             async: {
               type: "boolean",
@@ -252,7 +263,8 @@ async function handleCodexAgent(args) {
   const task = args.task;
   const sandbox = args.sandbox || "danger-full-access";
   const workingDirectory = args.workingDirectory;
-  const model = args.model;
+  const model = args.model || DEFAULT_MODEL;
+  const reasoningEffort = args.reasoningEffort || DEFAULT_REASONING_EFFORT;
   const asyncMode = args.async || false;
   const timeoutMs = args.timeoutMs || 0;
 
@@ -264,16 +276,16 @@ async function handleCodexAgent(args) {
   const codexArgs = [
     "exec",
     "--full-auto",
+    "--model",
+    model,
+    "-c",
+    `reasoning_effort="${reasoningEffort}"`,
     "--sandbox",
     sandbox,
     "--output-last-message",
     resultFile,
     task,
   ];
-
-  if (model) {
-    codexArgs.splice(1, 0, "--model", model);
-  }
 
   const fullCommand = `${CODEX_PATH} ${codexArgs.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')}`;
 
@@ -284,6 +296,7 @@ async function handleCodexAgent(args) {
     sandbox,
     workingDirectory,
     model,
+    reasoningEffort,
     status: "running",
     startedAt: new Date().toISOString(),
     logFile,
@@ -332,7 +345,8 @@ async function handleCodexAgent(args) {
   await appendFile(logFile, `Command: ${fullCommand}\n`);
   await appendFile(logFile, `Working directory: ${workingDirectory}\n`);
   await appendFile(logFile, `Sandbox: ${sandbox}\n`);
-  await appendFile(logFile, `Model: ${model || "(default)"}\n`);
+  await appendFile(logFile, `Model: ${model}\n`);
+  await appendFile(logFile, `Reasoning effort: ${reasoningEffort}\n`);
   await appendFile(logFile, `Timeout: ${timeoutMs > 0 ? `${timeoutMs}ms` : "none"}\n`);
   await appendFile(logFile, `${"=".repeat(60)}\n\n`);
 
