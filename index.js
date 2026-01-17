@@ -93,7 +93,7 @@ const DEFAULT_REASONING_EFFORT = "high";
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.3.0",
+    version: "1.4.0",
   },
   {
     capabilities: {
@@ -226,6 +226,31 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["taskId"],
         },
       },
+      {
+        name: "codex_wait",
+        description:
+          "Wait for a Codex task to complete. Blocks until the task finishes, then returns the full result. Useful for subagents monitoring async tasks.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            taskId: {
+              type: "string",
+              description: "The task ID to wait for",
+            },
+            pollIntervalMs: {
+              type: "number",
+              description: "How often to check status in ms (default: 5000)",
+              default: 5000,
+            },
+            timeoutMs: {
+              type: "number",
+              description: "Max time to wait in ms. 0 = no timeout (default).",
+              default: 0,
+            },
+          },
+          required: ["taskId"],
+        },
+      },
     ],
   };
 });
@@ -244,6 +269,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return await handleCodexTasks(args);
       case "codex_cancel":
         return await handleCodexCancel(args);
+      case "codex_wait":
+        return await handleCodexWait(args);
       default:
         return {
           content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -802,6 +829,116 @@ async function handleCodexCancel(args) {
       isError: true,
     };
   }
+}
+
+async function handleCodexWait(args) {
+  const taskId = args.taskId;
+  const pollIntervalMs = args.pollIntervalMs || 5000;
+  const timeoutMs = args.timeoutMs || 0;
+
+  const taskRecord = tasks.get(taskId);
+  if (!taskRecord) {
+    return {
+      content: [{ type: "text", text: `Task not found: ${taskId}` }],
+      isError: true,
+    };
+  }
+
+  // If already completed, return immediately
+  if (taskRecord.status !== "running") {
+    return {
+      content: [
+        {
+          type: "text",
+          text: formatWaitResult(taskId, taskRecord),
+        },
+      ],
+    };
+  }
+
+  const startWait = Date.now();
+
+  // Poll until complete or timeout
+  return new Promise((resolve) => {
+    const checkStatus = async () => {
+      const record = tasks.get(taskId);
+
+      // Check if completed
+      if (record.status !== "running") {
+        resolve({
+          content: [
+            {
+              type: "text",
+              text: formatWaitResult(taskId, record),
+            },
+          ],
+        });
+        return;
+      }
+
+      // Check timeout
+      if (timeoutMs > 0 && Date.now() - startWait > timeoutMs) {
+        resolve({
+          content: [
+            {
+              type: "text",
+              text: `## Codex Wait Timeout\n\n` +
+                `**Task ID:** ${taskId}\n` +
+                `**Status:** still running\n` +
+                `**Waited:** ${formatDuration(Date.now() - startWait)}\n` +
+                `**Timeout:** ${formatDuration(timeoutMs)}\n\n` +
+                `Task is still running. Use \`codex_status\` to check progress or \`codex_cancel\` to stop it.`,
+            },
+          ],
+        });
+        return;
+      }
+
+      // Send progress notification while waiting
+      await sendProgress(taskId, `Waiting for task (${formatDuration(Date.now() - startWait)} elapsed)`, {
+        status: "waiting",
+        taskStatus: record.status,
+        waitElapsed: formatDuration(Date.now() - startWait),
+      });
+
+      // Continue polling
+      setTimeout(checkStatus, pollIntervalMs);
+    };
+
+    checkStatus();
+  });
+}
+
+function formatWaitResult(taskId, taskRecord) {
+  const status = taskRecord.status === "completed" ? "completed successfully" : taskRecord.status;
+  let output = `## Codex Task Completed\n\n`;
+  output += `**Task ID:** ${taskId}\n`;
+  output += `**Status:** ${status}\n`;
+  output += `**Duration:** ${taskRecord.durationFormatted || "unknown"}\n`;
+
+  if (taskRecord.exitCode !== undefined && taskRecord.exitCode !== null) {
+    output += `**Exit code:** ${taskRecord.exitCode}\n`;
+  }
+
+  if (taskRecord.exitSignal) {
+    output += `**Exit signal:** ${taskRecord.exitSignal}\n`;
+  }
+
+  if (taskRecord.failureReason) {
+    output += `**Failure reason:** ${taskRecord.failureReason}\n`;
+  }
+
+  // Summary stats
+  output += `\n### Summary\n`;
+  output += `- Stdout: ${taskRecord.stdoutBytes || 0} bytes\n`;
+  output += `- Stderr: ${taskRecord.stderrBytes || 0} bytes\n`;
+  output += `- Heartbeats: ${taskRecord.heartbeatCount || 0}\n`;
+
+  if (taskRecord.result) {
+    output += `\n### Result\n${taskRecord.result}\n`;
+  }
+
+  return output;
 }
 
 function formatResult(taskId, taskRecord, result) {
