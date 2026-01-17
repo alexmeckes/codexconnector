@@ -89,14 +89,33 @@ function getSignalName(code) {
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.1.0",
+    version: "1.2.0",
   },
   {
     capabilities: {
       tools: {},
+      logging: {}, // Enable logging for progress notifications
     },
   }
 );
+
+// Helper to send progress notifications to Claude
+async function sendProgress(taskId, message, data = {}) {
+  try {
+    await server.sendLoggingMessage({
+      level: "info",
+      logger: "codex-connector",
+      data: {
+        taskId,
+        message,
+        timestamp: new Date().toISOString(),
+        ...data,
+      },
+    });
+  } catch (err) {
+    // Ignore notification errors - client may not support logging
+  }
+}
 
 // Tool definitions
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -278,6 +297,7 @@ async function handleCodexAgent(args) {
     stderrBytes: 0,
     lastActivityAt: new Date().toISOString(),
     lastActivityType: "started",
+    lastOutputSnippet: "",
     heartbeatCount: 0,
     timeoutMs,
     // Failure tracking
@@ -316,6 +336,12 @@ async function handleCodexAgent(args) {
   await appendFile(logFile, `Timeout: ${timeoutMs > 0 ? `${timeoutMs}ms` : "none"}\n`);
   await appendFile(logFile, `${"=".repeat(60)}\n\n`);
 
+  // Send initial progress notification
+  await sendProgress(taskId, "Codex task started", {
+    status: "running",
+    task: task.slice(0, 100),
+  });
+
   const codex = spawn(CODEX_PATH, codexArgs, {
     cwd: workingDirectory,
     stdio: ["ignore", "pipe", "pipe"],
@@ -328,25 +354,32 @@ async function handleCodexAgent(args) {
   await saveTasks();
 
   // Track activity and bytes
-  const updateActivity = (type, bytes = 0) => {
+  const updateActivity = (type, bytes = 0, snippet = "") => {
     taskRecord.lastActivityAt = new Date().toISOString();
     taskRecord.lastActivityType = type;
     if (type === "stdout") taskRecord.stdoutBytes += bytes;
     if (type === "stderr") taskRecord.stderrBytes += bytes;
+    if (snippet) {
+      // Keep last meaningful output snippet for progress updates
+      const cleaned = snippet.toString().trim().slice(-200);
+      if (cleaned.length > 10) {
+        taskRecord.lastOutputSnippet = cleaned;
+      }
+    }
   };
 
   // Stream output to log file with activity tracking
   codex.stdout.on("data", (data) => {
     logStream.write(data);
-    updateActivity("stdout", data.length);
+    updateActivity("stdout", data.length, data);
   });
 
   codex.stderr.on("data", (data) => {
     logStream.write(`[stderr] ${data}`);
-    updateActivity("stderr", data.length);
+    updateActivity("stderr", data.length, data);
   });
 
-  // Heartbeat logging for long-running tasks
+  // Heartbeat logging for long-running tasks - sends progress to Claude
   const heartbeatInterval = setInterval(async () => {
     if (taskRecord.status !== "running") {
       clearInterval(heartbeatInterval);
@@ -364,9 +397,26 @@ async function handleCodexAgent(args) {
 
     await appendFile(logFile, heartbeatMsg);
 
+    // Send progress notification to Claude
+    await sendProgress(taskId, `Task still running (${formatDuration(elapsed)} elapsed)`, {
+      status: "running",
+      elapsed: formatDuration(elapsed),
+      heartbeat: taskRecord.heartbeatCount,
+      stdoutBytes: taskRecord.stdoutBytes,
+      stderrBytes: taskRecord.stderrBytes,
+      lastActivity: `${formatDuration(lastActivity)} ago`,
+      lastActivityType: taskRecord.lastActivityType,
+      recentOutput: taskRecord.lastOutputSnippet.slice(-100),
+    });
+
     // Warn if no activity for 2+ minutes
     if (lastActivity > 120000) {
       await appendFile(logFile, `[${new Date().toISOString()}] WARNING: No activity for ${formatDuration(lastActivity)}\n`);
+      await sendProgress(taskId, `Warning: No activity for ${formatDuration(lastActivity)}`, {
+        status: "possibly_stalled",
+        elapsed: formatDuration(elapsed),
+        lastActivity: formatDuration(lastActivity),
+      });
     }
 
     await saveTasks();
@@ -382,6 +432,12 @@ async function handleCodexAgent(args) {
       await appendFile(logFile, `\n${"!".repeat(60)}\n`);
       await appendFile(logFile, `[${new Date().toISOString()}] TIMEOUT: Killing process after ${formatDuration(timeoutMs)}\n`);
       await appendFile(logFile, `${"!".repeat(60)}\n`);
+
+      await sendProgress(taskId, `Task timeout - killing process`, {
+        status: "timeout",
+        elapsed: formatDuration(elapsed),
+        limit: formatDuration(timeoutMs),
+      });
 
       codex.kill("SIGTERM");
       setTimeout(() => {
@@ -453,6 +509,15 @@ async function handleCodexAgent(args) {
       taskRecord.pid = null;
       if (failureReason) taskRecord.failureReason = failureReason;
 
+      // Send completion notification
+      await sendProgress(taskId, `Task ${code === 0 ? "completed" : "failed"}`, {
+        status: taskRecord.status,
+        duration: formatDuration(elapsed),
+        exitCode: code,
+        exitSignal: taskRecord.exitSignal,
+        failureReason,
+      });
+
       // Update debug file
       await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
       await saveTasks();
@@ -486,6 +551,14 @@ async function handleCodexAgent(args) {
       await appendFile(logFile, `${"!".repeat(60)}\n`);
 
       logStream.end();
+
+      // Send error notification
+      await sendProgress(taskId, `Task error: ${err.message}`, {
+        status: "failed",
+        error: err.message,
+        errorCode: err.code,
+        duration: formatDuration(elapsed),
+      });
 
       taskRecord.status = "failed";
       taskRecord.error = err.message;
@@ -521,7 +594,8 @@ async function handleCodexAgent(args) {
             `**Log file:** ${logFile}\n` +
             `**Debug file:** ${debugFile}\n\n` +
             `Use \`codex_status\` with this task ID to check progress.\n` +
-            `Use \`codex_cancel\` to stop the task.`,
+            `Use \`codex_cancel\` to stop the task.\n\n` +
+            `> **Note:** Progress notifications will be sent every 30 seconds while the task runs.`,
         },
       ],
     };
@@ -582,6 +656,9 @@ async function handleCodexStatus(args) {
       output += `**Last activity:** ${formatDuration(lastActivity)} ago (${taskRecord.lastActivityType})\n`;
     }
     output += `**Heartbeats:** ${taskRecord.heartbeatCount}\n`;
+    if (taskRecord.lastOutputSnippet) {
+      output += `**Recent output:** \`${taskRecord.lastOutputSnippet.slice(-80)}...\`\n`;
+    }
   }
 
   if (taskRecord.completedAt) {
@@ -684,6 +761,10 @@ async function handleCodexCancel(args) {
     taskRecord.failureReason = "Cancelled by user";
     await appendFile(taskRecord.logFile, `\n[${new Date().toISOString()}] CANCELLED: User requested cancellation\n`);
 
+    await sendProgress(taskId, "Task cancellation requested", {
+      status: "cancelling",
+    });
+
     codex.kill("SIGTERM");
 
     // Give it a moment then force kill if needed
@@ -752,9 +833,10 @@ async function main() {
   await initDirs();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Codex Connector MCP server v1.1.0 running on stdio");
+  console.error("Codex Connector MCP server v1.2.0 running on stdio");
   console.error(`Logs directory: ${LOGS_DIR}`);
   console.error(`Codex path: ${CODEX_PATH}`);
+  console.error("Progress notifications enabled");
 }
 
 main().catch((error) => {

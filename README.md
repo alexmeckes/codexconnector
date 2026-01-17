@@ -8,6 +8,7 @@ An MCP (Model Context Protocol) server that connects Claude Code to OpenAI's Cod
 - **Async task management** - run long tasks in the background
 - **Real-time log streaming** - monitor task progress
 - **Enhanced debugging** - heartbeats, activity tracking, failure diagnostics
+- **Progress notifications** - keeps Claude informed during long-running tasks
 - **Task persistence** - tasks survive server restarts
 - **Configurable sandbox levels** - control Codex permissions
 
@@ -91,6 +92,47 @@ Cancel a running task.
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `taskId` | string | Yes | The task ID to cancel |
+
+## Progress Notifications (v1.2.0)
+
+The server sends MCP logging notifications to keep Claude informed during long-running tasks. This prevents Claude from thinking a task is stuck and prematurely cancelling it.
+
+### Notifications Sent
+
+| Event | When | Data Included |
+|-------|------|---------------|
+| Task started | Immediately on spawn | Task ID, task description |
+| Heartbeat | Every 30 seconds | Elapsed time, bytes received, last activity, recent output snippet |
+| Stall warning | No activity for 2+ minutes | Elapsed time, time since last activity |
+| Timeout | When timeout limit reached | Elapsed time, timeout limit |
+| Completion | Task finishes | Status, duration, exit code/signal |
+| Error | Process error occurs | Error message, error code |
+
+### Example Notification Data
+
+```json
+{
+  "level": "info",
+  "logger": "codex-connector",
+  "data": {
+    "taskId": "a1b2c3d4",
+    "message": "Task still running (2m 30s elapsed)",
+    "status": "running",
+    "elapsed": "2m 30s",
+    "heartbeat": 5,
+    "stdoutBytes": 15234,
+    "stderrBytes": 892,
+    "lastActivity": "5.2s ago",
+    "lastActivityType": "stderr",
+    "recentOutput": "exec /bin/zsh -lc 'cat file.txt' succeeded..."
+  }
+}
+```
+
+This helps Claude understand that:
+- The task is still running (not frozen)
+- Progress is being made (bytes increasing)
+- What Codex is currently doing (recent output)
 
 ## Debugging Features (v1.1.0)
 
