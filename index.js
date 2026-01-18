@@ -93,7 +93,7 @@ const DEFAULT_REASONING_EFFORT = "high";
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.4.2",
+    version: "1.5.0",
   },
   {
     capabilities: {
@@ -167,6 +167,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: "number",
               description: "Timeout in ms. 0 = no timeout (default).",
               default: 0,
+            },
+            sessionId: {
+              type: "string",
+              description: "Resume a previous Codex session. Pass the sessionId from a completed task to continue the conversation.",
             },
           },
           required: ["task", "workingDirectory"],
@@ -294,25 +298,47 @@ async function handleCodexAgent(args) {
   const reasoningEffort = args.reasoningEffort || DEFAULT_REASONING_EFFORT;
   const asyncMode = args.async || false;
   const timeoutMs = args.timeoutMs || 0;
+  const sessionId = args.sessionId || null;
 
   const logFile = join(LOGS_DIR, `${taskId}.log`);
   const resultFile = join(LOGS_DIR, `${taskId}.result`);
   const debugFile = join(LOGS_DIR, `${taskId}.debug.json`);
 
-  // Build the codex command
-  const codexArgs = [
-    "exec",
-    "--full-auto",
-    "--model",
-    model,
-    "-c",
-    `reasoning_effort="${reasoningEffort}"`,
-    "--sandbox",
-    sandbox,
-    "--output-last-message",
-    resultFile,
-    task,
-  ];
+  // Build the codex command - use 'exec resume' if sessionId provided
+  let codexArgs;
+  if (sessionId) {
+    // Resume an existing session
+    codexArgs = [
+      "exec",
+      "resume",
+      sessionId,
+      "--full-auto",
+      "--model",
+      model,
+      "-c",
+      `reasoning_effort="${reasoningEffort}"`,
+      "--json",
+      "--output-last-message",
+      resultFile,
+      task,
+    ];
+  } else {
+    // New session
+    codexArgs = [
+      "exec",
+      "--full-auto",
+      "--model",
+      model,
+      "-c",
+      `reasoning_effort="${reasoningEffort}"`,
+      "--sandbox",
+      sandbox,
+      "--json",
+      "--output-last-message",
+      resultFile,
+      task,
+    ];
+  }
 
   const fullCommand = `${CODEX_PATH} ${codexArgs.map(a => a.includes(' ') ? `"${a}"` : a).join(' ')}`;
 
@@ -330,6 +356,9 @@ async function handleCodexAgent(args) {
     resultFile,
     debugFile,
     pid: null,
+    // Session tracking
+    resumedFromSession: sessionId,  // The session we're resuming (if any)
+    codexSessionId: null,           // Will be captured from JSONL output
     // Debug info
     command: fullCommand,
     codexPath: CODEX_PATH,
@@ -395,6 +424,9 @@ async function handleCodexAgent(args) {
   await saveTasks();
 
   // Track activity and bytes
+  let outputBuffer = "";
+  let sessionCaptured = false;
+
   const updateActivity = (type, bytes = 0, snippet = "") => {
     taskRecord.lastActivityAt = new Date().toISOString();
     taskRecord.lastActivityType = type;
@@ -413,6 +445,30 @@ async function handleCodexAgent(args) {
   codex.stdout.on("data", (data) => {
     logStream.write(data);
     updateActivity("stdout", data.length, data);
+
+    // Capture session ID from first JSONL line (thread.started event)
+    if (!sessionCaptured) {
+      outputBuffer += data.toString();
+      const lines = outputBuffer.split("\n");
+      for (const line of lines) {
+        if (line.trim()) {
+          try {
+            const json = JSON.parse(line);
+            if (json.thread_id) {
+              taskRecord.codexSessionId = json.thread_id;
+              sessionCaptured = true;
+              break;
+            }
+          } catch {
+            // Not valid JSON yet, keep buffering
+          }
+        }
+      }
+      // Clear buffer once we've captured session or buffer is too large
+      if (sessionCaptured || outputBuffer.length > 10000) {
+        outputBuffer = "";
+      }
+    }
   });
 
   codex.stderr.on("data", (data) => {
@@ -695,6 +751,9 @@ async function handleCodexStatus(args) {
 
   let output = `## Codex Task Status\n\n`;
   output += `**Task ID:** ${taskId}\n`;
+  if (taskRecord.codexSessionId) {
+    output += `**Session ID:** ${taskRecord.codexSessionId}\n`;
+  }
   output += `**Status:** ${taskRecord.status}\n`;
   output += `**Task:** ${taskRecord.task.slice(0, 100)}${taskRecord.task.length > 100 ? '...' : ''}\n`;
   output += `**Started:** ${taskRecord.startedAt}\n`;
@@ -954,6 +1013,10 @@ function formatResult(taskId, taskRecord, result) {
   const status = result.status === "completed" ? "completed successfully" : result.status;
   let output = `## Codex Agent Result\n\n`;
   output += `**Task ID:** ${taskId}\n`;
+  if (taskRecord.codexSessionId) {
+    output += `**Session ID:** ${taskRecord.codexSessionId}\n`;
+    output += `> To continue this conversation, use \`sessionId: "${taskRecord.codexSessionId}"\` in your next codex_agent call.\n\n`;
+  }
   output += `**Status:** ${status}\n`;
   output += `**Duration:** ${result.durationFormatted}\n`;
 

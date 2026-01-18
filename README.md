@@ -57,6 +57,7 @@ Spawn a Codex agent to handle a coding task.
 | `model` | string | No | Model override |
 | `async` | boolean | No | If true, returns immediately with task ID |
 | `timeoutMs` | number | No | Timeout in milliseconds (0 = no timeout) |
+| `sessionId` | string | No | Resume a previous Codex session (enables conversation continuity) |
 
 **Example:**
 ```
@@ -126,6 +127,43 @@ If you need to manually wait for a task:
 ```
 Use codex_wait with taskId "abc123" to wait for the task to complete
 ```
+
+## Session Continuation (v1.5.0)
+
+Codex tasks now support conversation continuity. When a task completes, you receive a **Session ID** that can be used to resume the conversation in a follow-up task.
+
+### How It Works
+
+1. Run a Codex task - on completion, you'll see a `Session ID` in the result
+2. To continue the conversation, pass that `sessionId` to your next `codex_agent` call
+3. Codex will resume with full context of the previous conversation
+
+### Example
+
+**First task:**
+```
+Use codex_agent to analyze the database schema in /path/to/project
+```
+
+Result includes: `Session ID: 019bd162-b15d-7a80-9679-31c377b79825`
+
+**Follow-up task (continues the conversation):**
+```
+Use codex_agent with sessionId "019bd162-b15d-7a80-9679-31c377b79825"
+to now add indexes based on your analysis
+```
+
+### Benefits
+
+- **Context preservation** - Codex remembers what it analyzed, what files it read, what decisions it made
+- **Iterative workflows** - Build on previous work without re-explaining
+- **Debugging continuity** - Ask follow-up questions about errors or outputs
+
+### Notes
+
+- Session IDs are also shown in `codex_status` output
+- Sessions are stored locally by Codex CLI in `~/.codex/sessions/`
+- When resuming, sandbox mode is inherited from the original session
 
 ## Progress Notifications (v1.2.0)
 
