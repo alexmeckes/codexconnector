@@ -4,7 +4,9 @@ An MCP (Model Context Protocol) server that connects Claude Code to OpenAI's Cod
 
 ## Features
 
-- **Spawn Codex agents** from within Claude Code sessions
+- **Interactive session selection** - choose to start fresh or continue a previous Codex conversation
+- **Run mode selection** - choose between waiting, async with monitoring, or manual status checks
+- **Session continuation** - resume previous Codex sessions with full context
 - **Async task management** - run long tasks in the background
 - **Real-time log streaming** - monitor task progress
 - **Enhanced debugging** - heartbeats, activity tracking, failure diagnostics
@@ -104,9 +106,33 @@ Wait for a Codex task to complete. Blocks until the task finishes, then returns 
 | `pollIntervalMs` | number | No | How often to check status (default: 5000ms) |
 | `timeoutMs` | number | No | Max time to wait, 0 = no timeout (default: 0) |
 
-## Subagent Monitoring Pattern (v1.4.0)
+### `codex_list_sessions`
 
-When you spawn an async Codex task, Claude will automatically be instructed to create a background subagent that monitors the task using `codex_wait`. This ensures:
+List recent Codex sessions that can be resumed. Used by Claude before starting a new task to let you choose between starting fresh or continuing an existing conversation.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `limit` | number | No | Max sessions to return (default: 10) |
+| `directory` | string | No | Filter sessions by working directory |
+
+## Interactive Task Flow (v1.6.0)
+
+When you ask Claude to run a Codex task, it will first ask you two questions:
+
+### Question 1: Session Selection
+- **Start new session** - Begin a fresh Codex conversation
+- **Continue existing session** - Resume a previous conversation with full context
+
+### Question 2: Run Mode
+- **Wait for completion** - Claude waits until the task finishes (blocking)
+- **Async with monitoring subagent** - Task runs in background, subagent notifies when done
+- **Async (manual status checks)** - Task runs in background, you check status manually
+
+This gives you full control over how Codex tasks are executed.
+
+## Subagent Monitoring Pattern
+
+When you select "Async with monitoring subagent", Claude spawns a background subagent that uses `codex_wait` to monitor the task. This ensures:
 
 1. **Reliable completion notification** - The subagent blocks until the task finishes
 2. **Non-blocking main conversation** - Claude can continue working on other things
@@ -115,10 +141,11 @@ When you spawn an async Codex task, Claude will automatically be instructed to c
 ### How It Works
 
 1. You ask Claude to run a Codex task
-2. Claude spawns the task with `async: true`
-3. The response instructs Claude to spawn a monitoring subagent
-4. The subagent calls `codex_wait(taskId)` which blocks until completion
-5. When the task finishes, the subagent reports the results
+2. Claude asks you about session and run mode preferences
+3. You select "Async with monitoring subagent"
+4. Claude spawns the task with `async: true`
+5. Claude spawns a background subagent that calls `codex_wait(taskId)`
+6. When the task finishes, the subagent reports the results
 
 ### Manual Usage
 

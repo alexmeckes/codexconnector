@@ -93,7 +93,7 @@ const DEFAULT_REASONING_EFFORT = "high";
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.5.0",
+    version: "1.6.0",
   },
   {
     capabilities: {
@@ -128,7 +128,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       {
         name: "codex_agent",
         description:
-          "Spawn an OpenAI Codex agent to handle a coding task. By default waits for completion. Set async=true for long-running tasks to get a task ID immediately.",
+          `Spawn an OpenAI Codex agent to handle a coding task.
+
+IMPORTANT: Before calling this tool, you MUST:
+1. Call codex_list_sessions to get available sessions
+2. Use AskUserQuestion to ask the user:
+   - Question 1: "Start new Codex session or continue existing?" with options showing recent sessions
+   - Question 2: "How should the task run?" with options: "Wait for completion", "Async with monitoring subagent", "Async (manual status checks)"
+3. Then call this tool with the user's selections (sessionId if continuing, async=true if async mode)
+
+If user selects "Async with monitoring subagent", after this tool returns, spawn a background Task subagent to call codex_wait.`,
         inputSchema: {
           type: "object",
           properties: {
@@ -255,6 +264,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["taskId"],
         },
       },
+      {
+        name: "codex_list_sessions",
+        description:
+          "List recent Codex sessions that can be resumed. Returns session ID, timestamp, working directory, and task preview. Use this before codex_agent to let the user choose whether to start fresh or continue an existing session.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            limit: {
+              type: "number",
+              description: "Max sessions to return (default: 10)",
+              default: 10,
+            },
+            directory: {
+              type: "string",
+              description: "Filter sessions by working directory (optional)",
+            },
+          },
+        },
+      },
     ],
   };
 });
@@ -275,6 +303,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return await handleCodexCancel(args);
       case "codex_wait":
         return await handleCodexWait(args);
+      case "codex_list_sessions":
+        return await handleCodexListSessions(args);
       default:
         return {
           content: [{ type: "text", text: `Unknown tool: ${name}` }],
@@ -684,24 +714,20 @@ async function handleCodexAgent(args) {
       content: [
         {
           type: "text",
-          text: `## Codex Task Started\n\n` +
+          text: `## Codex Task Started (Async)\n\n` +
             `**Task ID:** \`${taskId}\`\n` +
             `**PID:** ${codex.pid}\n` +
             `**Status:** running\n` +
-            `**Log file:** ${logFile}\n` +
-            `**Debug file:** ${debugFile}\n\n` +
-            `---\n\n` +
-            `### ⚠️ ACTION REQUIRED: Fire and Forget\n\n` +
-            `1. **Spawn a background subagent** using the Task tool:\n` +
-            `   - \`subagent_type: "general-purpose"\`\n` +
-            `   - \`run_in_background: true\`\n` +
-            `   - \`prompt: "Call codex_wait with taskId='${taskId}' and report results when complete."\`\n\n` +
-            `2. **Immediately continue** with other work or respond to the user.\n\n` +
-            `**DO NOT:**\n` +
-            `- Poll or check status yourself\n` +
-            `- Wait for the task to complete\n` +
-            `- Monitor the subagent\n\n` +
-            `The subagent handles everything. You are done with this task.`,
+            `**Session ID:** (will be available in status once captured)\n` +
+            `**Log file:** ${logFile}\n\n` +
+            `### Next Steps\n\n` +
+            `If user requested **monitoring subagent**, spawn one now:\n` +
+            `- Use Task tool with \`subagent_type: "general-purpose"\`, \`run_in_background: true\`\n` +
+            `- Prompt: "Call codex_wait with taskId='${taskId}' and report results when complete."\n\n` +
+            `If user requested **manual status checks**, inform them they can use:\n` +
+            `- \`codex_status\` to check progress\n` +
+            `- \`codex_cancel\` to stop the task\n\n` +
+            `> Progress notifications will be sent every 30 seconds while the task runs.`,
         },
       ],
     };
@@ -975,6 +1001,123 @@ async function handleCodexWait(args) {
 
     checkStatus();
   });
+}
+
+async function handleCodexListSessions(args) {
+  const limit = args.limit || 10;
+  const filterDirectory = args.directory || null;
+
+  const sessionsDir = join(homedir(), ".codex", "sessions");
+  const sessions = [];
+
+  try {
+    // Find all session files recursively
+    const findSessions = async (dir) => {
+      const entries = await readdir(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          await findSessions(fullPath);
+        } else if (entry.name.endsWith(".jsonl")) {
+          sessions.push(fullPath);
+        }
+      }
+    };
+
+    await findSessions(sessionsDir);
+
+    // Sort by modification time (newest first)
+    const sessionStats = await Promise.all(
+      sessions.map(async (path) => {
+        const { stat } = await import("fs/promises");
+        const stats = await stat(path);
+        return { path, mtime: stats.mtime };
+      })
+    );
+    sessionStats.sort((a, b) => b.mtime - a.mtime);
+
+    // Parse session metadata
+    const results = [];
+    for (const { path } of sessionStats.slice(0, limit * 2)) { // Get extra in case of filter
+      try {
+        const content = await readFile(path, "utf-8");
+        const firstLine = content.split("\n")[0];
+        const meta = JSON.parse(firstLine);
+
+        if (meta.type !== "session_meta" || !meta.payload) continue;
+
+        const payload = meta.payload;
+        const cwd = payload.cwd || "(unknown)";
+
+        // Apply directory filter
+        if (filterDirectory && !cwd.includes(filterDirectory)) continue;
+
+        // Find first user message for task preview
+        let taskPreview = "(no task preview)";
+        const eventLine = content.split("\n").find(line => line.includes('"type":"event_msg"'));
+        if (eventLine) {
+          try {
+            const event = JSON.parse(eventLine);
+            const msg = event.payload?.message || "";
+            taskPreview = msg.slice(0, 100).replace(/\n/g, " ");
+            if (msg.length > 100) taskPreview += "...";
+          } catch {}
+        }
+
+        // Extract directory name for display
+        const dirName = cwd.split("/").pop() || cwd;
+
+        results.push({
+          sessionId: payload.id,
+          timestamp: payload.timestamp,
+          directory: cwd,
+          directoryName: dirName,
+          taskPreview,
+        });
+
+        if (results.length >= limit) break;
+      } catch {}
+    }
+
+    // Format output for Claude to present to user
+    let output = `## Available Codex Sessions\n\n`;
+    output += `Found ${results.length} recent session(s).\n\n`;
+
+    if (results.length === 0) {
+      output += `No sessions found. A new session will be started.\n`;
+    } else {
+      output += `| # | Directory | Task | Session ID |\n`;
+      output += `|---|-----------|------|------------|\n`;
+
+      results.forEach((s, i) => {
+        const timeAgo = formatDuration(Date.now() - new Date(s.timestamp).getTime()) + " ago";
+        output += `| ${i + 1} | ${s.directoryName} | ${s.taskPreview.slice(0, 50)}${s.taskPreview.length > 50 ? '...' : ''} | \`${s.sessionId.slice(0, 8)}...\` |\n`;
+      });
+
+      output += `\n### Session Details\n\n`;
+      results.forEach((s, i) => {
+        output += `**${i + 1}. ${s.directoryName}** (${formatDuration(Date.now() - new Date(s.timestamp).getTime())} ago)\n`;
+        output += `- Session ID: \`${s.sessionId}\`\n`;
+        output += `- Directory: ${s.directory}\n`;
+        output += `- Task: ${s.taskPreview}\n\n`;
+      });
+    }
+
+    // Include structured data for Claude to use in AskUserQuestion
+    output += `\n---\n`;
+    output += `### For AskUserQuestion Options\n\n`;
+    output += `Use these session IDs when asking the user:\n`;
+    output += `\`\`\`json\n${JSON.stringify(results.map(s => ({ label: `[${s.directoryName}] ${s.taskPreview.slice(0, 40)}...`, sessionId: s.sessionId })), null, 2)}\n\`\`\`\n`;
+
+    return {
+      content: [{ type: "text", text: output }],
+    };
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error listing sessions: ${error.message}` }],
+      isError: true,
+    };
+  }
 }
 
 function formatWaitResult(taskId, taskRecord) {
