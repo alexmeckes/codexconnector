@@ -93,6 +93,40 @@ Cancel a running task.
 |-----------|------|----------|-------------|
 | `taskId` | string | Yes | The task ID to cancel |
 
+### `codex_wait`
+
+Wait for a Codex task to complete. Blocks until the task finishes, then returns the full result. This is the recommended way for subagents to monitor async tasks.
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `taskId` | string | Yes | The task ID to wait for |
+| `pollIntervalMs` | number | No | How often to check status (default: 5000ms) |
+| `timeoutMs` | number | No | Max time to wait, 0 = no timeout (default: 0) |
+
+## Subagent Monitoring Pattern (v1.4.0)
+
+When you spawn an async Codex task, Claude will automatically be instructed to create a background subagent that monitors the task using `codex_wait`. This ensures:
+
+1. **Reliable completion notification** - The subagent blocks until the task finishes
+2. **Non-blocking main conversation** - Claude can continue working on other things
+3. **Automatic result reporting** - When the task completes, the subagent reports back
+
+### How It Works
+
+1. You ask Claude to run a Codex task
+2. Claude spawns the task with `async: true`
+3. The response instructs Claude to spawn a monitoring subagent
+4. The subagent calls `codex_wait(taskId)` which blocks until completion
+5. When the task finishes, the subagent reports the results
+
+### Manual Usage
+
+If you need to manually wait for a task:
+
+```
+Use codex_wait with taskId "abc123" to wait for the task to complete
+```
+
 ## Progress Notifications (v1.2.0)
 
 The server sends MCP logging notifications to keep Claude informed during long-running tasks. This prevents Claude from thinking a task is stuck and prematurely cancelling it.

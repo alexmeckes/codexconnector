@@ -93,7 +93,7 @@ const DEFAULT_REASONING_EFFORT = "high";
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.4.0",
+    version: "1.4.1",
   },
   {
     capabilities: {
@@ -634,8 +634,18 @@ async function handleCodexAgent(args) {
             `**Status:** running\n` +
             `**Log file:** ${logFile}\n` +
             `**Debug file:** ${debugFile}\n\n` +
-            `Use \`codex_status\` with this task ID to check progress.\n` +
-            `Use \`codex_cancel\` to stop the task.\n\n` +
+            `---\n\n` +
+            `### ⚠️ IMPORTANT: Spawn a Monitoring Subagent\n\n` +
+            `You MUST spawn a background subagent to monitor this task. Use the Task tool with:\n\n` +
+            `\`\`\`\n` +
+            `subagent_type: "general-purpose"\n` +
+            `run_in_background: true\n` +
+            `prompt: "Monitor Codex task ${taskId} by calling codex_wait with taskId='${taskId}'. ` +
+            `When the task completes, report the results back. Do not poll with codex_status - ` +
+            `use codex_wait which blocks until completion."\n` +
+            `\`\`\`\n\n` +
+            `This ensures you receive the completion notification even if you're working on other things.\n\n` +
+            `---\n\n` +
             `> **Note:** Progress notifications will be sent every 30 seconds while the task runs.`,
         },
       ],
