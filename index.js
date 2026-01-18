@@ -93,7 +93,7 @@ const DEFAULT_REASONING_EFFORT = "high";
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.4.1",
+    version: "1.4.2",
   },
   {
     capabilities: {
@@ -635,18 +635,17 @@ async function handleCodexAgent(args) {
             `**Log file:** ${logFile}\n` +
             `**Debug file:** ${debugFile}\n\n` +
             `---\n\n` +
-            `### ⚠️ IMPORTANT: Spawn a Monitoring Subagent\n\n` +
-            `You MUST spawn a background subagent to monitor this task. Use the Task tool with:\n\n` +
-            `\`\`\`\n` +
-            `subagent_type: "general-purpose"\n` +
-            `run_in_background: true\n` +
-            `prompt: "Monitor Codex task ${taskId} by calling codex_wait with taskId='${taskId}'. ` +
-            `When the task completes, report the results back. Do not poll with codex_status - ` +
-            `use codex_wait which blocks until completion."\n` +
-            `\`\`\`\n\n` +
-            `This ensures you receive the completion notification even if you're working on other things.\n\n` +
-            `---\n\n` +
-            `> **Note:** Progress notifications will be sent every 30 seconds while the task runs.`,
+            `### ⚠️ ACTION REQUIRED: Fire and Forget\n\n` +
+            `1. **Spawn a background subagent** using the Task tool:\n` +
+            `   - \`subagent_type: "general-purpose"\`\n` +
+            `   - \`run_in_background: true\`\n` +
+            `   - \`prompt: "Call codex_wait with taskId='${taskId}' and report results when complete."\`\n\n` +
+            `2. **Immediately continue** with other work or respond to the user.\n\n` +
+            `**DO NOT:**\n` +
+            `- Poll or check status yourself\n` +
+            `- Wait for the task to complete\n` +
+            `- Monitor the subagent\n\n` +
+            `The subagent handles everything. You are done with this task.`,
         },
       ],
     };
