@@ -89,11 +89,12 @@ function getSignalName(code) {
 // Default model and reasoning settings
 const DEFAULT_MODEL = "gpt-5.2-codex";
 const DEFAULT_REASONING_EFFORT = "high";
+const SERVER_VERSION = "1.6.0";
 
 const server = new Server(
   {
     name: "codex-connector",
-    version: "1.6.0",
+    version: SERVER_VERSION,
   },
   {
     capabilities: {
@@ -330,6 +331,16 @@ async function handleCodexAgent(args) {
   const timeoutMs = args.timeoutMs || 0;
   const sessionId = args.sessionId || null;
 
+  if (!workingDirectory || typeof workingDirectory !== "string") {
+    throw new Error("workingDirectory is required and must be a string");
+  }
+  if (!existsSync(workingDirectory)) {
+    throw new Error(`Working directory does not exist: ${workingDirectory}`);
+  }
+  if (CODEX_PATH.includes("/") && !existsSync(CODEX_PATH)) {
+    throw new Error(`Codex binary not found at: ${CODEX_PATH}`);
+  }
+
   const logFile = join(LOGS_DIR, `${taskId}.log`);
   const resultFile = join(LOGS_DIR, `${taskId}.result`);
   const debugFile = join(LOGS_DIR, `${taskId}.debug.json`);
@@ -442,15 +453,213 @@ async function handleCodexAgent(args) {
     task: task.slice(0, 100),
   });
 
-  const codex = spawn(CODEX_PATH, codexArgs, {
-    cwd: workingDirectory,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: { ...process.env },
+  let codex;
+  try {
+    codex = spawn(CODEX_PATH, codexArgs, {
+      cwd: workingDirectory,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env },
+    });
+  } catch (err) {
+    const failureReason = `Failed to start process: ${err.message}`;
+    taskRecord.status = "failed";
+    taskRecord.error = err.message;
+    taskRecord.failureReason = failureReason;
+    taskRecord.completedAt = new Date().toISOString();
+    taskRecord.duration = 0;
+    taskRecord.durationFormatted = "0ms";
+    await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
+    await saveTasks();
+    throw new Error(failureReason);
+  }
+
+  let heartbeatInterval = null;
+  let timeout = null;
+  let completionFinalized = false;
+
+  // Attach completion/error handlers immediately to avoid unhandled spawn errors.
+  const completionPromise = new Promise((resolve) => {
+    codex.once("close", async (code, signal) => {
+      if (completionFinalized) return;
+      completionFinalized = true;
+
+      try {
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+        if (timeout) clearTimeout(timeout);
+        activeProcesses.delete(taskId);
+
+        const endTime = new Date().toISOString();
+        const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
+
+        // Determine failure reason
+        let failureReason = taskRecord.failureReason; // May already be set by timeout
+        const signalName = signal || getSignalName(code);
+
+        if (!failureReason) {
+          if (signal) {
+            failureReason = `Killed by signal: ${signal}`;
+          } else if (signalName && code !== 0) {
+            failureReason = `Killed by ${signalName} (exit code ${code})`;
+          } else if (code !== 0) {
+            failureReason = `Exited with code ${code}`;
+          }
+        }
+
+        // Write detailed exit info
+        await appendFile(logFile, `\n${"=".repeat(60)}\n`);
+        await appendFile(logFile, `[${endTime}] TASK ${code === 0 ? "COMPLETED" : "FAILED"}\n`);
+        await appendFile(logFile, `${"=".repeat(60)}\n`);
+        await appendFile(logFile, `Exit code: ${code}\n`);
+        await appendFile(logFile, `Exit signal: ${signal || signalName || "none"}\n`);
+        await appendFile(logFile, `Duration: ${formatDuration(elapsed)}\n`);
+        await appendFile(logFile, `Total stdout: ${taskRecord.stdoutBytes} bytes\n`);
+        await appendFile(logFile, `Total stderr: ${taskRecord.stderrBytes} bytes\n`);
+        await appendFile(logFile, `Heartbeats: ${taskRecord.heartbeatCount}\n`);
+        if (failureReason) {
+          await appendFile(logFile, `Failure reason: ${failureReason}\n`);
+        }
+        await appendFile(logFile, `${"=".repeat(60)}\n`);
+
+        logStream.end();
+
+        // Read result file
+        let result = null;
+        try {
+          result = await readFile(resultFile, "utf-8");
+          await appendFile(logFile, `\nResult file found (${result.length} bytes)\n`);
+        } catch (err) {
+          await appendFile(logFile, `\nNo result file: ${err.code}\n`);
+        }
+
+        // Update task record
+        taskRecord.status = code === 0 ? "completed" : "failed";
+        taskRecord.exitCode = code;
+        taskRecord.exitSignal = signal || signalName;
+        taskRecord.completedAt = endTime;
+        taskRecord.duration = elapsed;
+        taskRecord.durationFormatted = formatDuration(elapsed);
+        taskRecord.result = result;
+        taskRecord.pid = null;
+        if (failureReason) taskRecord.failureReason = failureReason;
+
+        // Send completion notification
+        await sendProgress(taskId, `Task ${code === 0 ? "completed" : "failed"}`, {
+          status: taskRecord.status,
+          duration: formatDuration(elapsed),
+          exitCode: code,
+          exitSignal: taskRecord.exitSignal,
+          failureReason,
+        });
+
+        // Update debug file
+        await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
+        await saveTasks();
+
+        resolve({
+          status: taskRecord.status,
+          exitCode: code,
+          exitSignal: taskRecord.exitSignal,
+          duration: elapsed,
+          durationFormatted: formatDuration(elapsed),
+          failureReason,
+          result,
+        });
+      } catch (err) {
+        taskRecord.status = "failed";
+        taskRecord.failureReason = `Internal close handler error: ${err.message}`;
+        taskRecord.completedAt = new Date().toISOString();
+        taskRecord.pid = null;
+        try {
+          await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
+          await saveTasks();
+        } catch {}
+        resolve({
+          status: "failed",
+          error: taskRecord.failureReason,
+          failureReason: taskRecord.failureReason,
+          duration: 0,
+          durationFormatted: "0ms",
+        });
+      }
+    });
+
+    codex.once("error", async (err) => {
+      if (completionFinalized) return;
+      completionFinalized = true;
+
+      try {
+        if (heartbeatInterval) clearInterval(heartbeatInterval);
+        if (timeout) clearTimeout(timeout);
+        activeProcesses.delete(taskId);
+
+        const endTime = new Date().toISOString();
+        const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
+        const failureReason = `Process error: ${err.message} (${err.code || "unknown"})`;
+
+        await appendFile(logFile, `\n${"!".repeat(60)}\n`);
+        await appendFile(logFile, `[${endTime}] PROCESS ERROR\n`);
+        await appendFile(logFile, `${"!".repeat(60)}\n`);
+        await appendFile(logFile, `Error: ${err.message}\n`);
+        await appendFile(logFile, `Code: ${err.code || "unknown"}\n`);
+        await appendFile(logFile, `Duration: ${formatDuration(elapsed)}\n`);
+        await appendFile(logFile, `${"!".repeat(60)}\n`);
+
+        logStream.end();
+
+        // Send error notification
+        await sendProgress(taskId, `Task error: ${err.message}`, {
+          status: "failed",
+          error: err.message,
+          errorCode: err.code,
+          duration: formatDuration(elapsed),
+        });
+
+        taskRecord.status = "failed";
+        taskRecord.error = err.message;
+        taskRecord.failureReason = failureReason;
+        taskRecord.completedAt = endTime;
+        taskRecord.duration = elapsed;
+        taskRecord.durationFormatted = formatDuration(elapsed);
+        taskRecord.pid = null;
+
+        await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
+        await saveTasks();
+
+        resolve({
+          status: "failed",
+          error: err.message,
+          failureReason,
+          duration: elapsed,
+          durationFormatted: formatDuration(elapsed),
+        });
+      } catch (handlerErr) {
+        taskRecord.status = "failed";
+        taskRecord.failureReason = `Internal error handler failure: ${handlerErr.message}`;
+        taskRecord.completedAt = new Date().toISOString();
+        taskRecord.pid = null;
+        try {
+          await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
+          await saveTasks();
+        } catch {}
+        resolve({
+          status: "failed",
+          error: err.message,
+          failureReason: taskRecord.failureReason,
+          duration: 0,
+          durationFormatted: "0ms",
+        });
+      }
+    });
   });
 
-  taskRecord.pid = codex.pid;
-  activeProcesses.set(taskId, codex);
-  await appendFile(logFile, `[${new Date().toISOString()}] Process spawned with PID ${codex.pid}\n\n`);
+  taskRecord.pid = codex.pid ?? null;
+  if (codex.pid) {
+    activeProcesses.set(taskId, codex);
+  }
+  await appendFile(
+    logFile,
+    `[${new Date().toISOString()}] Process spawned with PID ${codex.pid || "unavailable"}\n\n`
+  );
   await saveTasks();
 
   // Track activity and bytes
@@ -507,7 +716,7 @@ async function handleCodexAgent(args) {
   });
 
   // Heartbeat logging for long-running tasks - sends progress to Claude
-  const heartbeatInterval = setInterval(async () => {
+  heartbeatInterval = setInterval(async () => {
     if (taskRecord.status !== "running") {
       clearInterval(heartbeatInterval);
       return;
@@ -550,9 +759,12 @@ async function handleCodexAgent(args) {
   }, 30000); // Every 30 seconds
 
   // Set up timeout if specified
-  let timeout = null;
   if (timeoutMs > 0) {
     timeout = setTimeout(async () => {
+      if (completionFinalized || taskRecord.status !== "running") {
+        return;
+      }
+
       const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
       taskRecord.failureReason = `Timeout after ${formatDuration(elapsed)} (limit: ${formatDuration(timeoutMs)})`;
 
@@ -575,139 +787,6 @@ async function handleCodexAgent(args) {
     }, timeoutMs);
   }
 
-  // Handle completion
-  const completionPromise = new Promise((resolve) => {
-    codex.on("close", async (code, signal) => {
-      clearInterval(heartbeatInterval);
-      if (timeout) clearTimeout(timeout);
-      activeProcesses.delete(taskId);
-
-      const endTime = new Date().toISOString();
-      const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
-
-      // Determine failure reason
-      let failureReason = taskRecord.failureReason; // May already be set by timeout
-      const signalName = signal || getSignalName(code);
-
-      if (!failureReason) {
-        if (signal) {
-          failureReason = `Killed by signal: ${signal}`;
-        } else if (signalName && code !== 0) {
-          failureReason = `Killed by ${signalName} (exit code ${code})`;
-        } else if (code !== 0) {
-          failureReason = `Exited with code ${code}`;
-        }
-      }
-
-      // Write detailed exit info
-      await appendFile(logFile, `\n${"=".repeat(60)}\n`);
-      await appendFile(logFile, `[${endTime}] TASK ${code === 0 ? "COMPLETED" : "FAILED"}\n`);
-      await appendFile(logFile, `${"=".repeat(60)}\n`);
-      await appendFile(logFile, `Exit code: ${code}\n`);
-      await appendFile(logFile, `Exit signal: ${signal || signalName || "none"}\n`);
-      await appendFile(logFile, `Duration: ${formatDuration(elapsed)}\n`);
-      await appendFile(logFile, `Total stdout: ${taskRecord.stdoutBytes} bytes\n`);
-      await appendFile(logFile, `Total stderr: ${taskRecord.stderrBytes} bytes\n`);
-      await appendFile(logFile, `Heartbeats: ${taskRecord.heartbeatCount}\n`);
-      if (failureReason) {
-        await appendFile(logFile, `Failure reason: ${failureReason}\n`);
-      }
-      await appendFile(logFile, `${"=".repeat(60)}\n`);
-
-      logStream.end();
-
-      // Read result file
-      let result = null;
-      try {
-        result = await readFile(resultFile, "utf-8");
-        await appendFile(logFile, `\nResult file found (${result.length} bytes)\n`);
-      } catch (err) {
-        await appendFile(logFile, `\nNo result file: ${err.code}\n`);
-      }
-
-      // Update task record
-      taskRecord.status = code === 0 ? "completed" : "failed";
-      taskRecord.exitCode = code;
-      taskRecord.exitSignal = signal || signalName;
-      taskRecord.completedAt = endTime;
-      taskRecord.duration = elapsed;
-      taskRecord.durationFormatted = formatDuration(elapsed);
-      taskRecord.result = result;
-      taskRecord.pid = null;
-      if (failureReason) taskRecord.failureReason = failureReason;
-
-      // Send completion notification
-      await sendProgress(taskId, `Task ${code === 0 ? "completed" : "failed"}`, {
-        status: taskRecord.status,
-        duration: formatDuration(elapsed),
-        exitCode: code,
-        exitSignal: taskRecord.exitSignal,
-        failureReason,
-      });
-
-      // Update debug file
-      await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
-      await saveTasks();
-
-      resolve({
-        status: taskRecord.status,
-        exitCode: code,
-        exitSignal: taskRecord.exitSignal,
-        duration: elapsed,
-        durationFormatted: formatDuration(elapsed),
-        failureReason,
-        result,
-      });
-    });
-
-    codex.on("error", async (err) => {
-      clearInterval(heartbeatInterval);
-      if (timeout) clearTimeout(timeout);
-      activeProcesses.delete(taskId);
-
-      const endTime = new Date().toISOString();
-      const elapsed = Date.now() - new Date(taskRecord.startedAt).getTime();
-      const failureReason = `Process error: ${err.message} (${err.code || "unknown"})`;
-
-      await appendFile(logFile, `\n${"!".repeat(60)}\n`);
-      await appendFile(logFile, `[${endTime}] PROCESS ERROR\n`);
-      await appendFile(logFile, `${"!".repeat(60)}\n`);
-      await appendFile(logFile, `Error: ${err.message}\n`);
-      await appendFile(logFile, `Code: ${err.code || "unknown"}\n`);
-      await appendFile(logFile, `Duration: ${formatDuration(elapsed)}\n`);
-      await appendFile(logFile, `${"!".repeat(60)}\n`);
-
-      logStream.end();
-
-      // Send error notification
-      await sendProgress(taskId, `Task error: ${err.message}`, {
-        status: "failed",
-        error: err.message,
-        errorCode: err.code,
-        duration: formatDuration(elapsed),
-      });
-
-      taskRecord.status = "failed";
-      taskRecord.error = err.message;
-      taskRecord.failureReason = failureReason;
-      taskRecord.completedAt = endTime;
-      taskRecord.duration = elapsed;
-      taskRecord.durationFormatted = formatDuration(elapsed);
-      taskRecord.pid = null;
-
-      await writeFile(debugFile, JSON.stringify(taskRecord, null, 2));
-      await saveTasks();
-
-      resolve({
-        status: "failed",
-        error: err.message,
-        failureReason,
-        duration: elapsed,
-        durationFormatted: formatDuration(elapsed),
-      });
-    });
-  });
-
   if (asyncMode) {
     // Return immediately with task ID
     return {
@@ -716,8 +795,8 @@ async function handleCodexAgent(args) {
           type: "text",
           text: `## Codex Task Started (Async)\n\n` +
             `**Task ID:** \`${taskId}\`\n` +
-            `**PID:** ${codex.pid}\n` +
-            `**Status:** running\n` +
+            `**PID:** ${taskRecord.pid || "unavailable"}\n` +
+            `**Status:** ${taskRecord.status}\n` +
             `**Session ID:** (will be available in status once captured)\n` +
             `**Log file:** ${logFile}\n\n` +
             `### Next Steps\n\n` +
@@ -1010,6 +1089,22 @@ async function handleCodexListSessions(args) {
   const sessionsDir = join(homedir(), ".codex", "sessions");
   const sessions = [];
 
+  if (!existsSync(sessionsDir)) {
+    return {
+      content: [{
+        type: "text",
+        text:
+          "## Available Codex Sessions\n\n" +
+          "Found 0 recent session(s).\n\n" +
+          "No sessions found. A new session will be started.\n\n" +
+          "---\n" +
+          "### For AskUserQuestion Options\n\n" +
+          "Use these session IDs when asking the user:\n" +
+          "```json\n[]\n```\n",
+      }],
+    };
+  }
+
   try {
     // Find all session files recursively
     const findSessions = async (dir) => {
@@ -1199,7 +1294,7 @@ async function main() {
   await initDirs();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Codex Connector MCP server v1.2.0 running on stdio");
+  console.error(`Codex Connector MCP server v${SERVER_VERSION} running on stdio`);
   console.error(`Logs directory: ${LOGS_DIR}`);
   console.error(`Codex path: ${CODEX_PATH}`);
   console.error("Progress notifications enabled");

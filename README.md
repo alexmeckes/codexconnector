@@ -1,5 +1,7 @@
 # Codex Connector
 
+[![Regression Tests](https://github.com/alexmeckes/codexconnector/actions/workflows/regression.yml/badge.svg)](https://github.com/alexmeckes/codexconnector/actions/workflows/regression.yml)
+
 An MCP (Model Context Protocol) server that connects Claude Code to OpenAI's Codex CLI, enabling Claude to delegate coding tasks to Codex agents.
 
 ## Features
@@ -42,6 +44,26 @@ Add to your `~/.mcp.json`:
 ```
 
 Restart Claude Code and approve the MCP server when prompted.
+
+## Regression Tests
+
+Run the deterministic bridge regression suite:
+
+```bash
+npm run test:regression
+```
+
+This validates:
+- MCP server startup + tool registration
+- `codex_list_sessions` behavior on first-run systems with no `~/.codex/sessions`
+- `codex_agent` invalid `workingDirectory` handling
+- Spawn-failure handling without crashing the MCP server
+
+Optional live integration check (requires Codex CLI and credentials):
+
+```bash
+RUN_CODEX_INTEGRATION=1 npm run test:regression
+```
 
 ## Usage
 
